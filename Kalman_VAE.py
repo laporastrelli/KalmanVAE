@@ -303,7 +303,7 @@ class KalmanVAE(nn.Module):
 
         return imputed_smoothed_data, imputed_filtered_data, alpha.detach(), filtered_obs.detach(), smoothed_obs.detach(), gt_sample
 
-    def generate(self, x, mask, sample=False, full_alpha=False, use_gt_weights=False):  
+    def generate(self, x, mask, sample=False, full_alpha=False, use_gt_weights=False, sample_observation=False):  
 
         # get dims
         batch_size = x.size(0)
@@ -343,6 +343,9 @@ class KalmanVAE(nn.Module):
             to_cat = torch.zeros(batch_size, len(mask) - self.T, self.dim_a).to(a_sample.device)
             a_sample = torch.cat([a_sample, to_cat], dim=1)
 
+        # helper container
+        residuals = []
+
         # estimate observation from filtered posterior
         for t, mask_el in enumerate(mask):
             if mask_el != 0:
@@ -365,9 +368,24 @@ class KalmanVAE(nn.Module):
                     imputation_idx = t
                 
                 # get filtered distribution up to t=t-1
-                _, _, _, _, next_means, _, _, C, alpha = self.kalman_filter.filter(a_sample[:, start_idx:end_idx, :], 
-                                                                                   imputation_idx=imputation_idx, 
-                                                                                   gt_a=gt_a[:, start_idx:end_idx, :])
+                if gt_a is None:
+                    to_gt_a = gt_a
+                else:
+                    to_gt_a = gt_a[:, start_idx:end_idx, :]
+                
+                if sample_observation:
+                    _, _, _, _, next_means, _, _, C, alpha, r = self.kalman_filter.filter(a_sample[:, start_idx:end_idx, :], 
+                                                                                    imputation_idx=imputation_idx, 
+                                                                                    gt_a=to_gt_a, 
+                                                                                    sample_observation=sample_observation, 
+                                                                                    generation_idx=t)
+                    residuals.append(r.detach())
+                else:
+                    _, _, _, _, next_means, _, _, C, alpha = self.kalman_filter.filter(a_sample[:, start_idx:end_idx, :], 
+                                                                                    imputation_idx=imputation_idx, 
+                                                                                    gt_a=to_gt_a, 
+                                                                                    sample_observation=sample_observation, 
+                                                                                    generation_idx=t)
                 a_sample[:, t, :] = torch.matmul(C[:, C_idx, :, :], \
                                                   torch.stack(next_means).permute(1,0,2)[:, C_idx, :].unsqueeze(-1)).squeeze(-1)
 
@@ -378,6 +396,9 @@ class KalmanVAE(nn.Module):
         else:
             generated_data, _ = self.decoder(a_sample.view(batch_size*len(mask), -1))
 
-        return generated_data, a_sample.detach(), gt_obs, alpha.detach()
+        if sample_observation:
+            return generated_data, a_sample.detach(), gt_obs, alpha.detach(), residuals
+        else:
+            return generated_data, a_sample.detach(), gt_obs, alpha.detach()
     
     

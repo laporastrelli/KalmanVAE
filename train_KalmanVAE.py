@@ -6,7 +6,7 @@ import matplotlib.pyplot as plt
 import random
 import numpy as np
 import cv2
-
+import csv
 
 from Kalman_VAE import KalmanVAE
 from datetime import datetime
@@ -114,7 +114,7 @@ def test_reconstruction(test_loader, kvae, output_folder, args, dtype, visualize
         recon_error = mse_error/len(test_loader)
         print('Reconstruction Mean-Squared-Error: ', recon_error)
 
-        return recon_error
+        return recon_error.cpu().item()
 
 def test_imputation(test_loader, kvae, mask, output_folder, args, dtype, visualize=False):
     
@@ -178,9 +178,9 @@ def test_imputation(test_loader, kvae, mask, output_folder, args, dtype, visuali
         print('Imputation SMOOTHED Mean-Squared-Error: ', mse_error_smoothed/len(test_loader))
         print('Imputation FILTERED Mean-Squared-Error: ', mse_error_fitered/len(test_loader))
 
-    return smoothing_error, filtering_error
+    return smoothing_error.cpu().item(), filtering_error.cpu().item()
 
-def test_generation(test_loader, mask, kvae, output_folder, args, dtype, full_alpha=False, visualize=False):
+def test_generation(test_loader, mask, kvae, output_folder, args, dtype, visualize=False):
     
     kvae.eval()
     with torch.no_grad():
@@ -193,7 +193,11 @@ def test_generation(test_loader, mask, kvae, output_folder, args, dtype, full_al
                 sample = sample.to(dtype).to('cuda:' + str(args.device))
 
                 # get imputations
-                generated_seq, _, _ = kvae.generate(sample, mask)
+                generated_seq, _, _ = kvae.generate(sample, 
+                                                    mask,  
+                                                    full_alpha=args.full_alpha, 
+                                                    use_gt_weights=args.use_gt_weights,
+                                                    sample_observation=args.use_sampled_observation)
                 mse = nn.MSELoss()
                 mse_error += mse(generated_seq, sample)
 
@@ -230,20 +234,38 @@ def test_generation(test_loader, mask, kvae, output_folder, args, dtype, full_al
 
         else:
             distances = []
+            residuals_ = []
             gen_recon_error = 0.
+            gen_total_error = 0.
             for i, sample in enumerate(test_loader, 1):
                 
                 # get generated sequence
                 sample = sample > 0.5
                 sample = sample.to(dtype).to('cuda:' + str(args.device))
-                generated_seq, generated_obs, _, _ = kvae.generate(sample, 
-                                                                   mask, 
-                                                                   full_alpha=full_alpha, 
-                                                                   use_gt_weights=args.use_gt_weights)
+
+                if args.use_sampled_observation:
+                    generated_seq, generated_obs, _, _, residuals = kvae.generate(sample, 
+                                                                                  mask, 
+                                                                                  full_alpha=args.full_alpha, 
+                                                                                  use_gt_weights=args.use_gt_weights, 
+                                                                                  sample_observation=args.use_sampled_observation)
+                else:
+                    generated_seq, generated_obs, _, _ = kvae.generate(sample, 
+                                                                    mask, 
+                                                                    full_alpha=args.full_alpha, 
+                                                                    use_gt_weights=args.use_gt_weights, 
+                                                                    sample_observation=args.use_sampled_observation)
                 
                 mse = nn.MSELoss(reduction='none')
-                recon_error = mse_error(sample.cpu(), generated_seq.cpu()).sum(0, 2, 3, 4, 5).div(sample.size(0)*sample.size(2)*sample.size(3)*sample.size(4))
+                recon_error = mse(sample.cpu(), generated_seq.cpu()).sum([0, 2, 3, 4]).div(sample.size(0)*sample.size(2)*sample.size(3)*sample.size(4))
                 gen_recon_error += recon_error
+
+                mse_total = nn.MSELoss(reduction='mean')
+                total_error = mse_total(sample.cpu(), generated_seq.cpu())
+                gen_total_error += total_error
+                
+                if args.use_sampled_observation:
+                    residuals_.append(torch.stack(residuals).detach().mean(1))
 
                 # compute distance between consecutive datapoints in observation space
                 a = generated_obs[:, 1:, :]
@@ -254,7 +276,14 @@ def test_generation(test_loader, mask, kvae, output_folder, args, dtype, full_al
                 distances.append(distance)
 
             gen_recon_error = gen_recon_error/len(test_loader)
+            gen_total_error = gen_total_error/len(test_loader)
+
             distances_to_plot = torch.cat(distances, dim=0).cpu()
+
+            if args.use_sampled_observation:
+                residuals_to_plot = torch.stack(residuals_).mean(0).cpu()
+                aug = torch.zeros(args.n_of_starting_frames, residuals_to_plot.size(1))
+                residuals_to_plot_aug = torch.cat([aug, residuals_to_plot], dim=0)
 
             if args.use_gt_weights:
                 output_folder = os.path.join(output_folder, '', 'gt_weights')
@@ -262,12 +291,13 @@ def test_generation(test_loader, mask, kvae, output_folder, args, dtype, full_al
                     os.makedirs(output_folder)
 
             fig = plt.figure()
-            plt.errorbar(np.arange(len(mask)-1), distances_to_plot.mean(0).cpu(), yerr=distances_to_plot.var(0).cpu(), color="r")
             plt.plot(np.arange(len(mask)-1), distances_to_plot.mean(0).cpu())
             plt.xlabel('Time')
             plt.ylabel('Consecutive Distance')
             plt.title('Consecutive Points Distance - Generation')
             fig.savefig(os.path.join(output_folder, 'distance.png'))
+
+            np.save(os.path.join(output_folder, 'distance.npy'), distances_to_plot.mean(0).cpu().numpy())
 
             fig = plt.figure()
             plt.plot(np.arange(len(mask)), gen_recon_error.cpu())
@@ -275,6 +305,27 @@ def test_generation(test_loader, mask, kvae, output_folder, args, dtype, full_al
             plt.ylabel('Reconstruction MSE')
             plt.title('Generation Reconstruction Error')
             fig.savefig(os.path.join(output_folder, 'generation_mse.png'))
+
+            np.save(os.path.join(output_folder, 'generation_mse.npy'), gen_recon_error.cpu().numpy())
+
+            if args.use_sampled_observation:
+                fig = plt.figure()
+                plt.plot(np.arange(len(mask)), residuals_to_plot_aug[:, 0], label=f'$a_1$')
+                plt.plot(np.arange(len(mask)), residuals_to_plot_aug[:, 1], label=f'$a_2$')
+                plt.xlabel('Time')
+                plt.ylabel('Residuals')
+                if args.use_sampled_observation:
+                    plt.title('Residuals - Sampled Observations')
+                else:
+                    plt.title('Residuals - Zero-Observations')
+
+                fig.savefig(os.path.join(output_folder, 'residuals.png'))
+                print('#######################################################')
+                print(os.path.isfile(os.path.join(output_folder, 'residuals.png')))
+                print('#######################################################')
+                np.save(os.path.join(output_folder, 'residuals.npy'), residuals_to_plot_aug.cpu().numpy())
+
+    return gen_total_error.item()
 
 def plot(test_dl, 
          kvae, 
@@ -287,7 +338,6 @@ def plot(test_dl,
          training=False, 
          n_samples_to_plot=5, 
          device=0, 
-         full_alpha=False,
          return_paths=False):
     
     if single_plots:
@@ -361,8 +411,9 @@ def plot(test_dl,
                     # get generations
                     generated_seq, generated_obs, gt_obs, alpha = kvae.generate(batched_sample, 
                                                                                 mask, 
-                                                                                full_alpha=full_alpha, 
-                                                                                use_gt_weights=args.use_gt_weights)
+                                                                                full_alpha=args.full_alpha, 
+                                                                                use_gt_weights=args.use_gt_weights, 
+                                                                                sample_observation=args.use_sampled_observation)
                     generated_seq = generated_seq.cpu()
                     generated_obs = generated_obs.squeeze(-1).cpu()
                     gt_obs = gt_obs.cpu()
@@ -519,7 +570,11 @@ def plot(test_dl,
             if which == 'imputation':
                 x_hat, _ = kvae.impute(batched_sample[:imgs_to_show], mask)
             else:
-                x_hat = kvae.generate(batched_sample[:imgs_to_show], mask)
+                x_hat = kvae.generate(batched_sample[:imgs_to_show], 
+                                      mask, 
+                                      full_alpha=args.full_alpha, 
+                                      use_gt_weights=args.use_gt_weights, 
+                                      sample_observation=args.use_sampled_observation)
             
             png_files = []
 
@@ -590,7 +645,7 @@ def get_mask(masking_fraction, args, which='imputation', consecutive=True):
 def main(args):
 
     # set values for A and C matrices initialization
-    if args.tune_hyperparams:
+    if args.tune_hyperparams or args.tune_noise_parameters:
         if args.C_init == 0.:
             args.A_init = 1.
         elif args.C_init == 0.1 or args.C_init == 0.9:
@@ -689,21 +744,45 @@ def main(args):
             run_name = 'run_' + now.strftime("%Y_%m_%d_%H_%M_%S")
             save_filename = args.output_folder + '/{}'.format(args.dataset) + '/{}'.format(run_name) 
             if not os.path.isdir(save_filename):
-                os.makedirs(save_filename)
+                if (not args.tune_noise_parameters) or (not args.tune_noise_parameters): # avoid duplicates
+                    os.makedirs(save_filename)
 
             # create specific filename when tuning hyperparams
             if args.tune_hyperparams:
-                str_noise = str(args.R_noise_init).replace('.', '') # since R_init = Q_init always
+                str_noise = str(args.R_noise_init).replace('.', '') # since R_init = Q_init for this tuning
                 str_A = str(args.A_init).replace('.', '')
                 str_C = str(args.C_init).replace('.', '')
                 param_dir_name = "noise_{}_A_{}_C{}".format(str_noise, str_A, str_C)
                 save_filename = os.path.join(args.output_folder,'', 
                                              args.dataset, '', 
                                              'tune_hyperparams', '', 
+                                             'tune_noise_and_transitions', '',
                                              param_dir_name, '', 
                                              run_name)
                 if not os.path.isdir(save_filename):
                     os.makedirs(save_filename)
+            elif args.tune_noise_parameters:
+                str_Q = str(args.Q_noise_init).replace('.', '') 
+                str_R = str(args.R_noise_init).replace('.', '') 
+                param_dir_name = "Q_{}_R{}".format(str_Q, str_R)
+                save_filename = os.path.join(args.output_folder,'', 
+                                             args.dataset, '', 
+                                             'tune_hyperparams', '', 
+                                             'tune_noise', '',
+                                             param_dir_name, '', 
+                                             run_name)
+                if not os.path.isdir(save_filename):
+                    os.makedirs(save_filename)
+                
+                csv_results_file = os.path.join(args.output_folder,'', 
+                                                args.dataset, '', 
+                                                'tune_hyperparams', '', 
+                                                'tune_noise', '',
+                                                'tune_noise_results.csv')
+                if not os.path.isfile(csv_results_file):
+                    with open(csv_results_file, 'w', newline='\n') as file:
+                        writer = csv.writer(file)
+                        writer.writerow(['noise-config', 'reconstruction-error', 'imputation-error', 'generation-error'])
 
             # initialize wandb run
             run = wandb.init(project="KalmanVAE", 
@@ -730,6 +809,7 @@ def main(args):
                                     "use_mean": args.use_mean, 
                                     "symmetric-covariance": args.symmetric_covariance,
                                     "tune-hyperparams": args.tune_hyperparams,
+                                    "tune_noise_parameters": args.tune_noise_parameters
                                     },
                             name=run_name)
     
@@ -836,6 +916,11 @@ def main(args):
                 log_list.clear()
     
     if args.test:
+        
+        # create result list if tuning noise parameters
+        if args.tune_noise_parameters:
+            noise_config_str = 'Q={}, R={}'.format(args.Q_noise_init, args.R_noise_init)
+            tuning_noise_results = [noise_config_str]
 
         #### get filename
         if not args.train:
@@ -857,7 +942,10 @@ def main(args):
                                               dtype=dtype)
             print("Reconstruction error: ", recon_error)
             run.log({'reconstruction error': recon_error})
-        
+
+            if args.tune_noise_parameters:
+                tuning_noise_results.append(recon_error)
+
         
         ############################
         ######## IMPUTATION ########
@@ -889,6 +977,9 @@ def main(args):
             print('Filtering eroor: ', f_error)
             run.log({'smoothing error': s_error})
             run.log({'filtering error': f_error})
+
+            if args.tune_noise_parameters:
+                tuning_noise_results.append(s_error)
         
         if args.plot_imputation:
             output_folder = os.path.join(save_filename, '', 'dyn_analysis', '', 'imputations', '', 'mask_{}'.format(int(args.masking_fraction*100)))
@@ -906,6 +997,7 @@ def main(args):
                  args=args, 
                  which='imputation',
                  dtype=dtype, 
+                 n_samples_to_plot=5,
                  single_plots=args.plot_trajectories)
         
 
@@ -919,36 +1011,47 @@ def main(args):
         for mask_idx in range(len(mask)):
             if mask_idx in to_zero:
                 mask[mask_idx] = 0
-        
+
         # get folder name based on frames to generate
         dir_gen_name = 'gen_{}'.format(args.n_of_frame_to_generate)
+
+        if args.use_sampled_observation:
+            use_sampled_observation_dir = 'sampled_observation'
+        else:
+            use_sampled_observation_dir = ''
 
         # test generation: 
         # - MSE (gen-gt) (TODO)
         # - Consecutive-Distance(gen-gt) (TODO)
         if args.test_generation:
             if args.n_of_starting_frames == args.T:
-                output_folder = os.path.join(save_filename, '', 'generations', '', dir_gen_name, '', 'long_term')
+                output_folder = os.path.join(save_filename, '', 'generations', '', dir_gen_name, '', use_sampled_observation_dir, '', 'long_term')
             else:
-                output_folder = os.path.join(save_filename, '', 'generations', '', dir_gen_name, '', 'gt_comparison')
+                output_folder = os.path.join(save_filename, '', 'generations', '', dir_gen_name, '', use_sampled_observation_dir, '', 'gt_comparison')
             if not os.path.exists('{}'.format(output_folder)):
                 os.makedirs(output_folder)
                 
             print('Testing Generation ...')
-            test_generation(test_loader=test_loader_gen, 
-                            mask=mask, 
-                            kvae=kvae, 
-                            output_folder=output_folder, 
-                            args=args, 
-                            dtype=dtype, 
-                            full_alpha=args.full_alpha, 
-                            use_gt_weight=args.use_gt_weights)
-        
+            gen_mse = test_generation(test_loader=test_loader_gen, 
+                                      mask=mask, 
+                                      kvae=kvae, 
+                                      output_folder=output_folder, 
+                                      args=args, 
+                                      dtype=dtype)
+
+            if args.train:
+                run.log({'Generation error': gen_mse})
+
+            if args.tune_noise_parameters:
+                tuning_noise_results.append(gen_mse)
+            
+            print('generation MSE: ', gen_mse)
+            
         # plot generation:
         # - single plots (gen-gt | weights | a-trajectories) (TODO)
         # - batched plots (gen-gt) (TODO)
         if args.plot_generation:
-            output_folder = os.path.join(save_filename, '', 'dyn_analysis', '', 'generations', '', dir_gen_name)
+            output_folder = os.path.join(save_filename, '', 'dyn_analysis', '', 'generations', '', dir_gen_name, '', use_sampled_observation_dir)
             if not os.path.isdir(output_folder):
                 os.makedirs(output_folder)
             print('Plotting Generation ...')
@@ -961,8 +1064,14 @@ def main(args):
                  dtype=dtype, 
                  single_plots=args.plot_trajectories, 
                  n_samples_to_plot=10, 
-                 device=args.device, 
-                 full_alpha=args.full_alpha)
+                 device=args.device)
+
+
+        # write to csv if tuning noise parameters
+        if args.tune_noise_parameters:
+            with open(csv_results_file, 'a', newline='\n') as file:
+                writer = csv.writer(file)
+                writer.writerow(tuning_noise_results)
 
 
 if __name__ == '__main__':
@@ -1007,7 +1116,7 @@ if __name__ == '__main__':
         help='number of timestep in the dataset')
 
     # training parameters
-    parser.add_argument('--train', type=int, default=None,
+    parser.add_argument('--train', type=int, default=1,
         help='train model')
     parser.add_argument('--batch_size', type=int, default=128,
         help='batch size for training')
@@ -1035,10 +1144,12 @@ if __name__ == '__main__':
         help='decide whether to symmetrize covariances in Kalman Filter')
     parser.add_argument('--tune_hyperparams', type=int, default=0, 
         help='decide whether to tune A,C,Q,R')
+    parser.add_argument('--tune_noise_parameters', type=int, default=0, 
+        help='decide whether to tune noise covariance Q and R')
 
     # testing parameters
     parser.add_argument('--test', type=int, default=None,
-        help='test model')
+        help='set model to test mode')
     parser.add_argument('--test_reconstruction', type=int, default=0,
         help='test model reconstruction')
     
@@ -1066,7 +1177,9 @@ if __name__ == '__main__':
     parser.add_argument('--full_alpha', type=int,  default=1, 
         help='decide whether to compute alpha weights from whole sequence or last 50 frames')
     parser.add_argument('--use_gt_weights', type=int, default=0, 
-        help='For generation decide whether to use g weights instead of those reulting from estimated observations (analysis purposes)')
+        help='For generation decide whether to use gt weights instead of those reulting from estimated observations (analysis purposes)')
+    parser.add_argument('--use_sampled_observation', type=int, default=0, 
+        help='decide whether to use a sampled observation from the transition model during generation ')
 
     # logistics
     parser.add_argument('--datasets_root_dir', type=str, default="/data2/users/lr4617/data/",

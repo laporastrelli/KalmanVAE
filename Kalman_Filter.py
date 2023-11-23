@@ -2,6 +2,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from torch.distributions.multivariate_normal import MultivariateNormal
+
 class Dynamics_Network(nn.Module):
 
     def __init__(self,
@@ -134,7 +136,9 @@ class Kalman_Filter(nn.Module):
                a, 
                train_dyn_net=None, 
                imputation_idx=None, 
-               gt_a=None):
+               gt_a=None, 
+               sample_observation=False, 
+               generation_idx=None):
 
         '''
         This method carries out Kalman filtering based 
@@ -182,7 +186,6 @@ class Kalman_Filter(nn.Module):
         sigma_pred = sigma
 
         # iterate through the length of the sequence
-
         for t_step in range(sequence_len):
             
             # collect predicted mean and predicted covariance
@@ -197,14 +200,18 @@ class Kalman_Filter(nn.Module):
                     break
 
             # get residual
-            if a.size(1) > self.T:                    
-                r = a[:, t_step + (a.size(1) - self.T), :] - a_pred
-                '''
-                if t_step ==  sequence_len -1:
-                    print(a[:, t_step + (a.size(1) - self.T), :])
-                '''
+            if a.size(1) > self.T:           
+                
+                if t_step + (a.size(1) - self.T) == generation_idx and sample_observation:  
+                    a_pred_dist = MultivariateNormal(loc=a_pred, covariance_matrix=self.R)
+                    a_pred_sample = a_pred_dist.sample()
+                    r = a_pred_sample - a_pred
+
+                else:
+                    r = a[:, t_step + (a.size(1) - self.T), :] - a_pred
             else:
                 r = a[:, t_step, :] - a_pred
+
 
             # get Kalman gain
             S = torch.matmul(torch.matmul(C[:, t_step, :, :], sigma_pred), torch.transpose(C[:, t_step, :, :],1,2)) + self.R
@@ -237,7 +244,10 @@ class Kalman_Filter(nn.Module):
             covariances.append(sigma)
         
         if self.use_KVAE:
-            return mu, sigma, means, covariances, next_means, next_covariances, A, C, alpha
+            if sample_observation:
+                return mu, sigma, means, covariances, next_means, next_covariances, A, C, alpha, r
+            else:
+                return mu, sigma, means, covariances, next_means, next_covariances, A, C, alpha
         else:
             return mu, sigma, means, covariances, next_means, next_covariances, A, C
 
